@@ -1,0 +1,1390 @@
+
+---
+title: "COMPASS HVTN 119"
+author: "Daryl Morris"
+date: "May 18, 2020"
+output:
+  html_document:
+    keep_md: yes
+  pdf_document: 
+    keep_tex: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 12, dev = c("png", "pdf"))
+```
+
+###   Script to run COMPASS (and the flowWorkspace stuff) on rhino.fhcrc.org
+
+```{r load-libraries}
+
+setwd("/fh/fast/mcelrath_j/user/demorris/COMPASS_SIMULATION/code")
+
+##      (for copying files to/from scharpdata:)
+##     scp -r demorris@statsrv.scharp.org:/trials/vaccine/p100/analysis/adata/rx_v2.csv adata
+
+
+rm(list=ls())
+
+
+library(COMPASS)
+library(openCyto)
+library(flowWorkspace)
+library(CytoML)
+library(data.table)
+
+
+library(plyr); library(dplyr)
+library(stringi)
+library(stringr)
+```
+
+
+
+```{r loadOldModel, cache = TRUE, eval = TRUE}
+
+load("/home/demorris/HVTN_100_PartB_COMPASS/qdata/hvtn100_CompassModels_PartB_finalDurData_with17_redo.RData")
+
+#rm(list=setdiff(ls(),c("compassFit","CCMerge")))
+
+cFit = compassFit[["ZM96 gp120"]]
+
+rm(list=setdiff(ls(),c("cFit")))
+
+save.image("../qdata/hvtn100_CompassModels_PartB_finalDurData_with17_redo_SMALL.RData")
+
+```
+
+
+```{r defineUtilityFunctions, cache = TRUE, eval = TRUE}
+
+sortCategoryMatrix = function(catMat, reverseCytColumns = FALSE) {
+  orderCount = -1*catMat[,"Counts"]
+  orderCount[which(orderCount==0)] = -10
+  if(reverseCytColumns) {
+    xx = data.frame(orderCount,catMat[,(ncol(catMat)-1):1])     
+  } else {
+    xx = data.frame(orderCount,catMat[,1:(ncol(catMat)-1)])
+  }
+  oo = rev(do.call(order,as.list(xx)))
+  return(catMat[oo,])
+}
+# this function makes category names from the categories matrix
+convertCategoryMatToProfileNames = function(catMat) {
+  matOut = NULL
+  for(iCol in 1:(ncol(catMat)-1)) {
+    matOut = cbind(matOut,paste(c("!","")[1+catMat[,iCol]],colnames(catMat)[iCol],sep=""))
+  }
+  return(apply(matOut,1,function(x) paste(x,collapse="&")))
+}
+makeAllPossibleCombinations <- function(cytokines) {
+  numRows = 2^length(cytokines)
+  m <- sapply(-1 + (1:numRows),function(x){ as.integer(intToBits(x))})
+  m <- t(m[1:length(cytokines),])
+  m = cbind(m,apply(m,1,sum))
+  colnames(m) = c(cytokines,"Counts")
+  m = sortCategoryMatrix(m)
+  convertCategoryMatToProfileNames(m)
+}
+
+
+```
+
+
+
+```{r simulateData, cache = TRUE, eval = TRUE}
+
+simList = list()  
+
+simSpec = list()
+simSpec$description = "HVTN 100 final durability data (part B) redo.  Antigen = ZM96 gp120"
+simSpec$seed = 123456
+simSpec$sampleSize = nrow(cFit$data$meta)
+
+simList[[1]] = simSpec
+
+iSim = 1
+#for(iSim in 1:length(simList)) {
+  
+  cSimSpec = simList[[iSim]]
+  
+  # setup
+  cPosterior = cFit$fit$posterior
+  allSampleNames = names(cPosterior)
+  samplesize = cSimSpec$sampleSize
+  numgammacols = ncol(cFit$fit$mean_gamma)  
+  
+  # get missing columns from the gamma matrix (since SimpleCOMPASS expects full matrices)
+  cytokines = setdiff(colnames(cFit$fit$categories),"Counts")
+  allCytokinesOrder = makeAllPossibleCombinations(cytokines)
+  missingGammaCols = setdiff(allCytokinesOrder, colnames(cFit$fit$mean_gamma))
+  
+  # set seed
+  set.seed(cSimSpec$seed)
+  
+  # draw names with replacement from sample names
+  sampleSet = sample(allSampleNames,samplesize,replace=TRUE)
+  
+  # unique names of samples (combines sample name and row)
+  uSampleSet = paste(sampleSet,1:samplesize,sep=".")
+
+  # make a gamma matrix for all samples 
+  meanGammaSamples = cFit$fit$mean_gamma[sampleSet,]
+  gammaUnif = matrix(runif(samplesize*numgammacols),ncol=numgammacols)
+  gammaMat = 1*(gammaUnif<meanGammaSamples)
+
+  # make list = p for each sampel ... pi = psiγi + pui(1−γi)
+  pullSubjectMultinomialProbs = function(sampleIndex) {
+    sampleName = sampleSet[sampleIndex]
+    cGamma = gammaMat[sampleIndex,]
+    psi = cPosterior[[sampleName]]$p_s * cGamma[-numgammacols] + 
+          cPosterior[[sampleName]]$p_u * (1-cGamma[-numgammacols])
+    pi = c(psi,(1-(sum(psi))))
+    pui = cPosterior[[sampleName]]$p_u
+    pui = c(pui,(1-(sum(pui))))
+    names(pi) = colnames(gammaMat)
+    names(pui) = colnames(gammaMat)
+    counts_s = cFit$data$counts_s[[sampleName]]
+    counts_u = cFit$data$counts_u[[sampleName]]
+    cellcount_s = rmultinom(1,counts_s,pi)
+    cellcount_u = rmultinom(1,counts_u,pui)
+    return(list(sampleName = sampleName,
+              pi = pi,
+              psi = cPosterior[[sampleName]]$p_s,
+              pui = cPosterior[[sampleName]]$p_u,
+              gamma = cGamma,
+              counts_s = counts_s,
+              counts_u = counts_u,
+              cellcount_s = cellcount_s,
+              cellcount_u = cellcount_u,
+              meta = cFit$data$meta[sampleName,]))
+  }
+  
+  pList = lapply(1:samplesize,pullSubjectMultinomialProbs)
+  names(pList) = uSampleSet
+
+  simList[[iSim]]$sampleList = pList
+  
+  # manipulate into matrices for SimpleCOMPASS
+  # n_s  NOTE: SimpleCOMPASS wants all the columns so we have to add in 0s
+  
+  padWithZeros = FALSE
+  temp = do.call(rbind,lapply(pList,function(x) t(x$cellcount_s)))
+  if(padWithZeros) {
+    temp = cbind(temp,matrix(0,ncol=length(missingGammaCols),nrow = nrow(temp)))
+    colnames(temp) = c(colnames(gammaMat),missingGammaCols)
+    rownames(temp) = uSampleSet 
+    simList[[iSim]]$n_s = temp[,allCytokinesOrder]
+  } else {
+    colnames(temp) = colnames(gammaMat)
+    rownames(temp) = uSampleSet
+    simList[[iSim]]$n_s = temp
+  }
+  # n_u
+  temp = do.call(rbind,lapply(pList,function(x) t(x$cellcount_u)))
+  if(padWithZeros) {  
+    temp = cbind(temp,matrix(0,ncol=length(missingGammaCols),nrow = nrow(temp)))
+    colnames(temp) = c(colnames(gammaMat),missingGammaCols)
+    rownames(temp) = uSampleSet 
+    simList[[iSim]]$n_u = temp[,allCytokinesOrder]
+  } else {
+    colnames(temp) = colnames(gammaMat)
+    rownames(temp) = uSampleSet
+    simList[[iSim]]$n_u = temp
+  }
+  
+  # meta
+  simList[[iSim]]$meta = do.call(rbind,lapply(pList,function(x) data.frame(PTID.VISITNO = x$sampleName)))
+  simList[[iSim]]$meta$name = names(pList)
+  # remaining vars for SimpleCOMPASS
+  simList[[iSim]]$individual_id = "name"
+  simList[[iSim]]$iterations = 40000
+  simList[[iSim]]$replications = 8
+  simList[[iSim]]$COMPASS_seeds = c(123456,234567,345678,456789,567890,678901,
+                                    789012,890123,901234,1234501,2345612,3456734)
+#}
+  
+
+  
+  
+rm(list = setdiff(ls(),c("cFit","simList")))
+#save.image("../qdata/firstSim.RData")
+
+```
+
+
+
+
+#######################
+### Run COMPASS Models
+######################
+
+```{r runCOMPASS, cache = TRUE, eval = TRUE}
+
+
+compassFit = list()
+
+for(iSim in 1:length(simList)) {
+
+  fileOut = paste("../qdata/CompassModels_Sim_",iSim,"_2.RData",sep="")
+
+  #for(iSeed in simList[[iSim]]$COMPASS_seeds) {
+  for(iSeed in 6:length(simList[[iSim]]$COMPASS_seeds)) {
+    
+    currentSeed =  simList[[iSim]]$COMPASS_seeds[iSeed]
+    
+    cat("Current Stim Set = ",iSim,":",currentSeed,".\n")
+    
+    set.seed(currentSeed)
+    
+    compassFit[[paste(iSim,currentSeed,sep=":")]] = 
+      SimpleCOMPASS( n_s = simList[[iSim]]$n_s,
+                     n_u = simList[[iSim]]$n_u,
+                     meta = simList[[iSim]]$meta,
+                     individual_id = simList[[iSim]]$individual_id,
+                     iterations = simList[[iSim]]$iterations,
+                     replications = simList[[iSim]]$replications)
+  }
+  save.image(fileOut,safe=FALSE)
+}  
+
+```
+
+
+### Combine COMPASS Results (if necessary) and re-save
+
+```{r combineCOMPASSruns, cache = TRUE, eval = TRUE}
+
+load("../qdata/tempCompassModels_Sim_1.RData")
+
+cStats = COMPASSMCMCDiagnosis(compassFit)
+
+if(FALSE) {
+  # NOTE: need to make a smaller version of the CD8 models with just
+  #     compassFit renamed as compassFit_8only
+  load("../qdata/CompassModels_HVTN_107_CD8.RData")
+  for(iName in names(compassFit_8only)) compassFit[[iName]] = compassFit_8only[[iName]]
+}
+keepVars = c(keepVars,c("compassFit","seedSet","tempCCMerge"))
+rm(list = setdiff(ls(),keepVars))
+save.image(paste("../qdata/CompassModels_",runSetup$shortRunDesc,"_all.RData",sep=""))
+
+```
+
+### Define function to calculate scores.  Then calculated un-pooled scores.
+
+```{r computeScores, cache = TRUE, eval = TRUE}
+
+makeFS_PFS_Scores <- function(antigens, profileSets = c("all","noIL4GzB"),
+                              tcellsubs = c("CD4+","CD8+")) {
+                              
+  # note: only two profile sets currently supported: "all" and "noIL4GzB"                            
+  FS = list()
+  
+  for(iTcellsub in tcellsubs) {
+  for(iAntigen in setdiff(antigens,"negctrl"))  {    
+  
+    cFit = compassFit[[paste(runSetup$shortRunDesc,iTcellsub,iAntigen,sep=":")]]
+    
+    for(iProfileSet in profileSets)  {
+      if(iProfileSet == "all") {
+        nCat = which(cFit$data$categories[,"Counts"]==0)
+        mean_gamma <- cFit$fit$mean_gamma[,-nCat]
+        degree <- cFit$data$categories[-nCat,"Counts"]
+      } else {   #noIL4GzB"
+        cCat = cFit$data$categories
+        if(all(c("GzB","IL4") %in% colnames(cCat))) {
+          indices = c(which(cCat[,"GzB"] == 1 & cCat[,"Counts"] == 1),
+                  which(cCat[,"IL4"] == 1 & cCat[,"Counts"] == 1),
+                  which(cCat[,"GzB"] == 1 & cCat[,"IL4"] == 1 & cCat[,"Counts"] == 2),
+                  which(cCat[,"Counts"] == 0))
+        } else if("IL4" %in% colnames(cCat)) {
+          indices = c(which(cCat[,"IL4"] == 1 & cCat[,"Counts"] == 1),
+                    which(cCat[,"Counts"] == 0))
+        } else if("GzB" %in% colnames(cCat)) {
+          indices = c(which(cCat[,"GzB"] == 1 & cCat[,"Counts"] == 1),
+                    which(cCat[,"Counts"] == 0))
+        } else {
+          indices = which(cCat[,"Counts"] == 0)
+        }
+        mean_gamma <- cFit$fit$mean_gamma[,-indices]
+        degree <- cCat[-indices,"Counts"]
+      }    
+      maxDegree = ncol(cFit$data$categories)-1
+  
+      #temp <- data.frame(y=FunctionalityScore(cFit))
+      temp <- data.frame(y=FunctionalityScore(x = mean_gamma, n =maxDegree))
+      temp$PTID = rownames(temp)
+      temp$score = "FunctionalityScore"
+      temp$profileSet = iProfileSet
+      temp$runDesc = runSetup$shortRunDesc
+      temp$tcellsub = iTcellsub
+      temp$stimSet = iAntigen
+      temp$functionalSet = paste(colnames(cFit$fit$categories)[1:maxDegree],collapse=",") 
+      FS[[paste(iTcellsub,iAntigen,iProfileSet,"FunctionalityScore",sep=":")]] = temp
+      
+      #temp <- data.frame(y=PolyfunctionalityScore(cFit))
+      temp <- data.frame(y=PolyfunctionalityScore(x = mean_gamma, degree = degree, n = maxDegree))
+      temp$PTID = rownames(temp)
+      temp$score = "PolyfunctionalityScore"
+      temp$profileSet = iProfileSet
+      temp$runDesc = runSetup$shortRunDesc
+      temp$tcellsub = iTcellsub
+      temp$stimSet = iAntigen
+      temp$functionalSet = paste(colnames(cFit$fit$categories)[1:maxDegree],collapse=",")
+      FS[[paste(iTcellsub,iAntigen,iProfileSet,"PolyfunctionalityScore",sep=":")]] = temp
+    }
+  }}
+
+  returnMat = do.call(rbind,FS)
+  rownames(returnMat) = NULL
+  returnMat$VISITNO = returnMat$PTID
+  returnMat$PTID = unlist(lapply(strsplit(returnMat$PTID,":"),function(x) x[1]))
+  returnMat$VISITNO = unlist(lapply(strsplit(returnMat$VISITNO,":"),function(x) x[2]))
+  return(returnMat)
+}
+
+sumMat = makeFS_PFS_Scores(runSetup$antigens) 
+
+```
+
+
+### Pool antigens to make ANY responses and calculate any scores
+
+```{r makeANY, cache = TRUE, eval = TRUE}
+
+#  this function reorders the resulting superset of  “categories" matrices in the "right way".
+#     reverseCytColumns= TRUE sorts it such that the profiles expressing the top cytokine on the heatmap 
+#              are on the left.
+sortCategoryMatrix = function(catMat, reverseCytColumns = FALSE) {
+  orderCount = -1*catMat[,"Counts"]
+  orderCount[which(orderCount==0)] = -10
+  if(reverseCytColumns) {
+    xx = data.frame(orderCount,catMat[,(ncol(catMat)-1):1])     
+  } else {
+    xx = data.frame(orderCount,catMat[,1:(ncol(catMat)-1)])
+  }
+  oo = rev(do.call(order,as.list(xx)))
+  return(catMat[oo,])
+}
+# this function makes category names from the categories matrix
+convertCategoryMatToProfileNames = function(catMat) {
+  matOut = NULL
+  for(iCol in 1:(ncol(catMat)-1)) {
+    matOut = cbind(matOut,paste(c("!","")[1+catMat[,iCol]],colnames(catMat)[iCol],sep=""))
+  }
+  return(apply(matOut,1,function(x) paste(x,collapse="&")))
+}
+
+makePosAdj <- function(cCompassFit,logCutoff=.000001) {
+  
+  # first create needed structures for plot.COMPASSResult
+  #compassFitOut = list()
+  compassFitOut = cCompassFit
+  compassFitOut$fit$mean_gamma = 100*(cCompassFit$data$n_s/cCompassFit$data$counts_s -
+                                        cCompassFit$data$n_u/cCompassFit$data$counts_u)
+  compassFitOut$fit$mean_gamma = apply(compassFitOut$fit$mean_gamma,2,function(x) pmax(logCutoff,x))
+  rownames(compassFitOut$fit$mean_gamma) = rownames(cCompassFit$data$n_s)
+  compassFitOut$data$meta = cCompassFit$data$meta
+  #rownames(compassFitOut$data$meta) = rownames(cCompassFit$data$n_s)
+  compassFitOut$data$individual_id = cCompassFit$data$individual_id 
+  compassFitOut$fit$categories = cCompassFit$fit$categories
+  
+  # now we'll re-sort the mean_gamma and meta rows by functionality score
+  sortNames = names(sort(FunctionalityScore(cCompassFit),decreasing=TRUE))
+  compassFitOut$fit$mean_gamma = compassFitOut$fit$mean_gamma[sortNames,]
+  compassFitOut$data$meta = compassFitOut$data$meta[match(sortNames,compassFitOut$data$meta$PTID.VISITNO),]
+  
+  # finally log conversion (with cutoff)
+  rowNames = rownames(compassFitOut$fit$mean_gamma)
+  compassFitOut$fit$mean_gamma = apply(compassFitOut$fit$mean_gamma,2,
+                                       function(x) log10(pmax(logCutoff,x)))
+  rownames(compassFitOut$fit$mean_gamma) = rowNames
+  
+  compassFitOut
+}
+
+makeANY <- function(tcellsub,pfsScores,antigenSet,idcols = c("PTID","VISITNO")) {
+  # tcellsub would probably be "CD4+" or "CD8+"
+  pfsScores$idvar = apply(pfsScores[,idcols],1,function(x) paste(x,collapse=":"))
+  pfsScores = pfsScores[order(pfsScores$stimSet),]
+  findMaxDF = pfsScores %>% filter(stimSet %in% antigenSet) %>%
+    group_by(idvar) %>% 
+    summarise(max = max(y),vals = paste(y,collapse=","),source = stimSet[which(y==max)[1]]) %>% 
+    as.data.frame
+  cFitItems = paste(runSetup$shortRunDesc,tcellsub,antigenSet,sep=":")
+  bC = unique(do.call(rbind,lapply(cFitItems,function(x) compassFit[[x]]$fit$categories)))
+  bC = sortCategoryMatrix(bC,reverseCytColumns=TRUE)
+  allCols = convertCategoryMatToProfileNames(bC)
+  ###
+  returnRows <- function (antigen) {
+    if(antigen %in% findMaxDF$source) {
+      whichRows = subset(findMaxDF,source == antigen)$idvar
+      iName = paste(runSetup$shortRunDesc,tcellsub,antigen,sep=":")
+      mg = compassFit[[iName]]$fit$mean_gamma[whichRows,]
+      n_s = compassFit[[iName]]$data$n_s[whichRows,]
+      n_u = compassFit[[iName]]$data$n_u[whichRows,]
+      counts_s = compassFit[[iName]]$data$counts_s[whichRows]
+      counts_u = compassFit[[iName]]$data$counts_u[whichRows]       
+      if(any(!allCols %in% colnames(mg))) {
+        missingCols = setdiff(allCols,colnames(mg))
+        new0 = matrix(0,ncol=length(missingCols),nrow=nrow(mg))
+        colnames(new0) = missingCols
+        mg = cbind(mg,new0)
+        mg = mg[,allCols]
+        n_s = cbind(n_s,new0)
+        n_s = n_s[,allCols]
+        n_u = cbind(n_u,new0)
+        n_u = n_u[,allCols]        
+      }
+      rownames(mg) = whichRows
+      rownames(n_s) = whichRows
+      rownames(n_u) = whichRows      
+      return(list(mg=mg,n_s=n_s,n_u=n_u,counts_s=counts_s,counts_u=counts_u))
+    } else {
+      return(NULL)
+    }
+  }
+  lOut = lapply(antigenSet,returnRows)
+  mean_gamma = do.call(rbind,lapply(lOut,function(x) x$mg))
+  mean_gamma = mean_gamma[findMaxDF$idvar,]
+  n_s = do.call(rbind,lapply(lOut,function(x) x$n_s))
+  n_s = n_s[findMaxDF$idvar,]  
+  n_u = do.call(rbind,lapply(lOut,function(x) x$n_u))
+  n_u = n_u[findMaxDF$idvar,]  
+  counts_s = unlist(lapply(lOut,function(x) x$counts_s))
+  counts_s = counts_s[findMaxDF$idvar]
+  counts_u = unlist(lapply(lOut,function(x) x$counts_u))
+  counts_u = counts_u[findMaxDF$idvar]  
+  # this part may be less generalizable to other runs of COMPASS
+  temp = data.frame(matrix(as.numeric(do.call(rbind,strsplit(findMaxDF$idvar,split=":"))),ncol=2)) 
+  names(temp) = c("PTID","VISITNO")
+  findMaxDF = cbind(findMaxDF,temp)
+  findMaxDF = dplyr::rename(findMaxDF,PTID.VISITNO=idvar)
+  #
+  
+  output = list(fit = list(mean_gamma=mean_gamma,categories = bC),
+                data = list(meta=findMaxDF,categories = bC, 
+                            individual_id = "PTID.VISITNO", sample_id = "name",
+                            counts_s = counts_s,n_s = n_s, counts_u = counts_u, n_u=n_u))
+  class(output) <- "COMPASSResult"
+  return(output)
+}
+
+
+for(iTcellsub in names(CCMerge)) {
+for(iPool in names(runSetup$poolAntigens)) {
+  compassFit[[paste(runSetup$shortRunDesc,iTcellsub,iPool,sep=":")]] = makeANY(tcellsub = iTcellsub,
+                        pfsScores = subset(sumMat,tcellsub==iTcellsub & profileSet == "noIL4GzB" & score=="FunctionalityScore"),
+                        antigenSet = runSetup$poolAntigens[[iPool]])
+}}
+
+
+sumMatPool = makeFS_PFS_Scores(names(runSetup$poolAntigens)) 
+sumMat = rbind(sumMat,sumMatPool)
+
+```
+
+
+### Bring in rx data
+
+```{r importTreatmentCodes, cache = TRUE, eval = TRUE}
+
+rxdata = read.table(runSetup$rxdataFile,sep=",",header=T)
+rxdata$PTID = as.numeric(gsub("-","",as.character(rxdata$PTID)))
+
+table(unique(sumMat$PTID) %in% unique(rxdata$PTID)) 
+
+sumMat = merge(sumMat,rxdata[,c("PTID","rx_code")])    
+
+write.table(sumMat,paste("../pdata/pdata_",runSetup$shortRunDesc,".csv",sep=""),
+            sep=",",row.names = FALSE)
+
+
+```
+
+### Pre-process mean_gamma for plotting (to simplify the code later) THEN SAVE
+
+```{r preProcessMeangamma, cache = TRUE, eval = TRUE}
+
+allAntigens = c(names(runSetup$poolAntigens),setdiff(runSetup$antigens,"negctrl"))
+allRxcodes = names(runSetup$rxCodes)
+
+plotSetList = list()
+
+for(iTcellsub in runSetup$cellSubsets) {
+  # determine superset of categories for all models
+  #    (potentially different for CD4+ vs CD8+)
+  cFitItems = paste(runSetup$shortRunDesc,iTcellsub,runSetup$antigens,sep=":")
+  bigCategories = unique(do.call(rbind,lapply(cFitItems,function(x) compassFit[[x]]$fit$categories)))
+  
+  if(all(c("GzB","IL4") %in% colnames(bigCategories))) {
+    whichVec = c(which(bigCategories[,"GzB"] == 1 & bigCategories[,"Counts"] == 1),
+               which(bigCategories[,"IL4"] == 1 & bigCategories[,"Counts"] == 1),
+               which(bigCategories[,"GzB"] == 1 & bigCategories[,"IL4"] == 1 & bigCategories[,"Counts"] == 2))
+  } else if("IL4" %in% colnames(bigCategories)) {
+    whichVec = which(bigCategories[,"IL4"] == 1 & bigCategories[,"Counts"] == 1)
+  } else if("GzB" %in% colnames(bigCategories)) {
+    whichVec = which(bigCategories[,"GzB"] == 1 & bigCategories[,"Counts"] == 1)
+  } else {
+    whichVec = NULL
+  }  
+  if(length(whichVec)>0) {
+    whichProfilesRemove = convertCategoryMatToProfileNames(bigCategories[whichVec,])
+    bigCategories = bigCategories[-whichVec,]
+  } else {
+    whichProfilesRemove = NULL
+  }
+  
+  # we no longer have to re-order the category columns since we did it at the CCMerge stage!
+  #    So, we'll allProfilesOrder to know what profiles are missing,
+  #    and reorder the columns of mean_gamma (after we add the missing zero columns)
+  bigCategories = sortCategoryMatrix(bigCategories)
+  allProfilesOrder = convertCategoryMatToProfileNames(bigCategories)
+  bigCategoriesNew = bigCategories
+  colnames(bigCategoriesNew) = gsub("CD154","CD40L",colnames(bigCategoriesNew))
+  allProfilesOrderNew = convertCategoryMatToProfileNames(bigCategoriesNew)
+  
+  plotSetList[[iTcellsub]] = list(bigCategories,allProfilesOrder,whichProfilesRemove,
+                                  bigCategoriesNew,allProfilesOrderNew)
+  names(plotSetList[[iTcellsub]]) = c("bigCategories","allProfilesOrder","whichProfilesRemove",
+                                      "bigCategoriesNew","allProfilesOrderNew")
+}
+
+keepVars = c(keepVars,c("sumMat","rxdata","plotSetList","allAntigens","allRxcodes",
+                        "makeFS_PFS_Scores","convertCategoryMatToProfileNames",
+                        "sortCategoryMatrix","makeANY","makePosAdj"))
+rm(list = setdiff(ls(),keepVars))
+save.image(paste("../qdata/CompassModels_",runSetup$shortRunDesc,"_allPlus.RData",sep=""))
+
+```
+
+
+### MORE Pre-process mean_gamma for plotting (to simplify the code later) 
+#   (this happens after last save because we explode the memory size)
+
+```{r preProcessMeangamma2, cache = TRUE, eval = TRUE}
+
+summaryList = list()
+pctPosAdjList = list()
+fitCopySave = list()
+
+for(iTcellsub in runSetup$cellSubsets) {  
+for(iStimSet in allAntigens) {
+
+  iModel = paste(runSetup$shortRunDesc,iTcellsub,iStimSet,sep=":")
+  
+  fitCopy = compassFit[[iModel]]
+  
+  cPlotSetList = plotSetList[[iTcellsub]]
+
+  ###########
+  # Add "missing" profiles to mean_gamma, n_s, n_u (and remove the IL4 IL4/GzB)
+  for(iMat in c("mean_gamma","n_s","n_u")) {
+    if(iMat == "mean_gamma") {
+      tempFit = fitCopy$fit$mean_gamma
+    } else if(iMat == "n_s") { 
+      tempFit = fitCopy$data$n_s
+    } else { 
+      tempFit = fitCopy$data$n_u
+    }
+          
+    if(any(cPlotSetList$whichProfilesRemove %in% colnames(tempFit))) {
+      tempFit = tempFit[,-which(colnames(tempFit) %in% cPlotSetList$whichProfilesRemove)]
+    }
+    
+    missingCols = setdiff(cPlotSetList$allProfilesOrder,colnames(tempFit))
+    if(length(missingCols)>0) {
+      appendCols = matrix(0,ncol=length(missingCols),nrow=nrow(tempFit))
+      colnames(appendCols) = missingCols
+      tempFit = cbind(tempFit,appendCols)
+      mm = match(cPlotSetList$allProfilesOrder,colnames(tempFit))
+      tempFit = tempFit[,mm]
+    } else {
+      mm = match(cPlotSetList$allProfilesOrder,colnames(tempFit))
+      tempFit = tempFit[,mm]      
+    }
+    colnames(tempFit) = gsub("CD154","CD40L",colnames(tempFit))
+    
+    if(iMat == "mean_gamma") {
+      fitCopy$fit$mean_gamma = tempFit
+    } else if(iMat == "n_s") { 
+      fitCopy$data$n_s = tempFit
+    } else { 
+      fitCopy$data$n_u = tempFit
+    }
+  }
+  fitCopy$fit$categories = cPlotSetList$bigCategoriesNew
+  fitCopy$data$categories = cPlotSetList$bigCategoriesNew
+    
+  # MERGE in treatment codes to meta (preserving meta order)
+  fitCopy$data$meta$rownum = 1:nrow(fitCopy$data$meta)
+  fitCopy$data$meta = merge(fitCopy$data$meta,rxdata[,c("PTID","rx_code")],all.x=TRUE)
+  fitCopy$data$meta = fitCopy$data$meta[order(fitCopy$data$meta$rownum),]
+
+  fitCopySave[[iModel]] = fitCopy
+    
+  ############## CALL TO makePosAdj 
+  ##   Note: putting it here makes it so we don't have to repeat 
+  ##          the work of re-ordering & padding the data matrices
+  pctPosAdjList[[iModel]] = makePosAdj(fitCopy,logCutoff=.0002)
+   
+  ############    
+  # make data for collapsed heatmap  
+  ccFitSumm = fitCopy
+  tmpListOut = list()
+  for(iTrt in allRxcodes) { 
+    for(iVisitSumm in runSetup$visitsToInclude) {   
+      
+      whichVec = which(ccFitSumm$data$meta$VISITNO==iVisitSumm & ccFitSumm$data$meta$rx_code == iTrt &
+                       ccFitSumm$data$meta$PTID.VISITNO %in% rownames(ccFitSumm$fit$mean_gamma))
+      if(length(whichVec)<3) {
+        cat("no rows ",iTrt,":",iVisitSumm,"\n")
+        next
+      }
+      whichRows = ccFitSumm$data$meta$PTID.VISITNO[whichVec]
+      #tmpListOut[[paste(iTrt,iVisitSumm,sep=":")]] = apply(ccFitSumm$fit$mean_gamma[whichRows,],2,median)
+      tmpListOut[[paste(iTrt,iVisitSumm,sep=":")]] = apply(ccFitSumm$fit$mean_gamma[whichRows,],2,mean)   
+  }}
+  tempFit = do.call(rbind,tmpListOut)
+      
+  ccFitSumm$data$individual_id = "name"
+  metadata = data.frame(do.call(rbind,strsplit(names(tmpListOut),":")))
+  names(metadata)=c("rx_code","VISIT")
+  metadata$rx_code = factor(metadata$rx_code,levels=allRxcodes)
+  # we want "name" and rownames(mean_gamma) to be visit, but all the rows need different
+  #    names, so we'll add spaces (which will be invisible)
+  #metadata$name = paste("V",metadata$VISIT,c(""," ","  ","   ","     ","      ")[metadata$rx_code],sep="")
+  metadata$name = str_pad(paste("V",metadata$VISIT,sep=""),width= 2 + as.numeric(metadata$rx_code),
+                          side='right', pad = ' ')
+
+  ccFitSumm$data$meta = metadata
+  rownames(tempFit) = metadata$name
+  ccFitSumm$fit$mean_gamma = tempFit
+  summaryList[[iModel]] = ccFitSumm
+}}  
+
+```
+
+
+
+### Boxplots of scores
+
+```{r boxplotsOfUselessScores, cache = TRUE, eval = TRUE}
+
+# vacinees-only plots?
+
+source("../macro/thaiTrialPlots.R")
+
+forGraphics = subset(sumMat,profileSet == "noIL4GzB")
+
+forGraphics$stimSet = factor(forGraphics$stimSet,levels = allAntigens)
+forGraphics$rx_code = factor(forGraphics$rx_code,levels = allRxcodes)
+
+bgVec = "#ffffff"
+forGraphics$colVec = runSetup$colRxCodes[match(forGraphics$rx_code,allRxcodes)]
+
+capListBox = list()
+iCaption = 1
+plotFileType = "PDF"  # "PNG" #
+
+plotFileNameBox=paste("../graph/compassScoreBoxPlots_",runSetup$shortRunDesc,sep="")
+
+# setting up for single-page device 
+fnameBox = justGraphicsSetupOnePage(plotFileNameBox ,pageNum = NULL, 
+                                   plotFileType=plotFileType, addDate=TRUE)
+
+ylimList = list()
+for(iTcellsub in runSetup$cellSubsets) {
+for(iScore in c("FunctionalityScore","PolyfunctionalityScore")) {
+  # Note: subset to   noIL4GzB happened above.
+  ylimList[[paste(iTcellsub,iScore)]] = range(subset(forGraphics,
+                                            tcellsub == iTcellsub & score == iScore)$y)
+}} 
+
+for(iTcellsub in runSetup$cellSubsets) {
+for(iStimSet in allAntigens) {
+for(iScore in c("FunctionalityScore","PolyfunctionalityScore")) {
+#for(iProfileSet in c("noIL4GzB")) {
+
+  # Note: subset to   noIL4GzB happened above.
+  subCData = subset(forGraphics,tcellsub == iTcellsub & stimSet==iStimSet & score == iScore)
+  if(nrow(subCData)==0) next
+      
+  # setting up for single-page device 
+  cFilename = justGraphicsSetupOnePage(plotFileNameBox,pageNum = iCaption, 
+                                           plotFileType=plotFileType, addDate=TRUE)
+      
+  width = 10
+  height = 6.5
+      
+  if(plotFileType=="PDF") {
+    pdf(file = cFilename, height=height,width = width) #width=10)
+  } else {
+    png(file = cFilename, height=height,width=width, units="in",res=150)
+  }
+      
+  #layoutPage(suppressTables=TRUE)
+  par(pardefault)
+  par(oma=c(.5,0,3,0)) # oma=c(.5,0,3,0)
+  layout(matrix(c(1,0,2)),height=c(lcm(11.1),lcm(.85),lcm(3)))  #height=c(lcm(12.0),lcm(.85),lcm(2.1)))      
+      
+  cexList$subMainLine = 2.5
+  cexList$YLabelLineSingle= 5   # default 4  
+      
+  cexList$bigTLineSingle = 0 # -0.5
+  cexList$cex.bigTitle = 1.8 # 1.65
+  cexList$cex.boxpoints = 1.5 #1
+  cexList$cex.plotAxisSingle = 1.1
+  cexList$cex.boxpoints = 1.2 #default 1.5
+      
+  ylim = ylimList[[paste(iTcellsub,iScore)]] 
+      
+  bbgOut = boxplotgrp2(subCData,y="y",grp1="VISITNO",grp2="rx_code", grp3= NULL,
+                           ylim = ylim, #c(0,100), 
+                           grp2Line = 0.5, #log.cutoff = 0.01, 
+                           main="", ylab="Score", grp2LabCex = 1.5,grp3LabCex = 1.2, legend = FALSE,
+                           diagGrp2Lab = FALSE,bottomGrp3Lab = TRUE,
+                           colVec = subCData$colVec, pchVec=subCData$pchVec, 
+                           extraPvalSpacing = 20)
+                           #doLinesAlso = TRUE,id="ptidscore")#extraLegendSpacing=1) 
+
+  visitLabels = runSetup$visitLabels[match(bbgOut$uniqSet$VISITNO,runSetup$visitsToInclude)]
+  myaxis(1,at=bbgOut$locVec,  #c(par("usr")[1],bbgOut$locVec), 
+         labels = visitLabels, tick = FALSE, font=2,line=-1)
+
+  main1 = paste(gsub("_","",runSetup$shortRunDesc),"\n",iTcellsub, 
+                " Polyfunctionality Score to ",iStimSet,sep="")  
+  if(iScore == "FunctionalityScore") main1 = gsub("Polyfunctionality","Functionality",main1)
+
+  parcex = par("cex")
+  title(main=main1, cex.main=1.7/parcex,outer=TRUE, line=-1.5, font = 2)
+      
+  # add legend
+  par(mar = c(0,0,0,0))
+  plot(0:1,0:1,type="n",axes=FALSE,xlab="",ylab="",main="")
+
+  legend("center",
+         legend = unlist(runSetup$rxCodes),
+         col = runSetup$colRxCodes, pch = 19,
+         bty="n",cex = 1.8)
+
+  capListBox[[iCaption]] = gsub("\n"," - ",main1)
+  iCaption = iCaption + 1
+      
+  dev.off()
+  
+}}}
+
+```
+
+
+### Heatmaps of mean gamma (Mean probability of response by profile and ptid)
+
+```{r ordinaryHeatmaps, cache = TRUE, eval = TRUE}
+
+
+plotFileNameHeat = paste("../graph/heatmaps_",runSetup$shortRunDesc,"_",
+                         format(Sys.Date(), "%d%b%Y"),sep="")
+
+fname = justGraphicsSetupOnePage(plotFileName=plotFileNameHeat,pageNum = NULL, 
+                             plotFileType=plotFileType)
+
+capList = list()
+currentCap = 1
+
+iProtocol = gsub("_"," ",runSetup$shortRunDesc)
+
+width = 5.5
+height = 8
+
+for(iTcellsub in runSetup$cellSubsets) {  
+for(iStimSet in allAntigens) {
+for(iVisit in runSetup$visitsToInclude) {        
+
+  iModel = paste(runSetup$shortRunDesc,iTcellsub,iStimSet,sep=":")
+  
+  cFilename = justGraphicsSetupOnePage(plotFileName=plotFileNameHeat,pageNum = currentCap, 
+                                         plotFileType=plotFileType, addDate=FALSE)  
+  
+  if(plotFileType=="PDF") {
+    pdf(file = cFilename, height=height,width=width)
+  } else if(plotFileType=="PS") {
+    pdf(file = cFilename, height=height,width=width)
+  } else { #PNG
+    png(file = cFilename, height=height,width=width, units="in",res=150,bg="white")
+  }
+
+  main = paste(iProtocol," COMPASS\n",iTcellsub," - ",iStimSet," - Visit ",iVisit,sep="")
+  
+  ############
+  #  Setup for basic heatmaps (includes seting up colors)
+  VISITNO = NULL
+  PTID=NULL
+  Trt = NULL    
+
+  Var1 =  runSetup$colRxCodes
+  names(Var1) = allRxcodes      
+  row_ann_col = list(Trt=Var1)      
+  fitCopySave[[iModel]]$data$meta$Trt = fitCopySave[[iModel]]$data$meta$rx_code
+  
+  plot(fitCopySave[[iModel]],"Trt", 
+       subset = VISITNO==iVisit, # & PTID %in% partB_PTIDs,
+       main = main,
+       threshold = -1,order_by=FunctionalityScore,
+       #threshold = -1, order_by= NULL,
+       #show_rownames = TRUE,
+       breaks = seq(0,1,by=.05),         
+       row_annotation_colors = row_ann_col, 
+       order_by_max_functionality=FALSE) 
+      
+  capList[[currentCap]] = gsub("\n"," - ",main)
+  currentCap = currentCap + 1
+  dev.off()
+      
+  #######  Pct Pos Adj heatmaps
+  if(FALSE) {
+    cFilename = justGraphicsSetupOnePage(plotFileName=plotFileNameHeat,pageNum = currentCap, 
+                                           plotFileType=plotFileType, addDate=FALSE)
+    if(plotFileType=="PDF") {
+      pdf(file = cFilename, height=height,width=width)
+    } else if(plotFileType=="PS") {
+      pdf(file = cFilename, height=height,width=width)
+    } else { #PNG
+      png(file = cFilename, height=height,width=width, units="in",res=150,bg="white")
+    }      
+            
+    main2 = paste(iProtocol," Adjusted Pct Positive\n",iTcellsub," - ",
+                  iStimSet," - Visit ",iVisit,sep="")
+      
+    pctPosAdjList[[iModel]]$data$meta$Trt = pctPosAdjList[[iModel]]$data$meta$rx_code
+      
+    plot(pctPosAdjList[[iModel]],"Trt",
+         subset = VISITNO==iVisit, # & PTID %in% partB_PTIDs,
+         main = main2, threshold = -6.5, # note: threshold is log10(logCutoff)
+         order_by= NULL,
+         palette = colorRampPalette(brewer.pal(10, "Reds"))(13),
+         show_rownames = FALSE,
+         breaks = c(-3.8,seq(-3,1,by=.5)),
+           #c(-6,seq(-4,1,by=.5)), #c(-1,10^(seq(-4,2,by=.5))),
+         legend_breaks= c(-3.7,3,2,1,0,1),
+            #-4:1, #10^(-3:2),
+         legend_labels = c(".0002",".001",".01",".1","1","10"),
+            #c(".0001",".001",".01",".1","1","10"),
+         row_annotation_colors = row_ann_col,
+         order_by_max_functionality=FALSE) 
+    
+    capList[[currentCap]] = gsub("\n", " - ",main2)
+    currentCap = currentCap + 1
+    dev.off()
+  }
+
+}}}
+
+preCollapsed = currentCap
+
+```
+
+
+### Summary heatmaps
+```{r summaryHeatmaps, cache=TRUE,eval=TRUE}
+
+#### NOW PLOT THE COLLAPSED ("Summary") HEATMAPS  
+
+width = 5.5
+height = 3.1 #4.2
+
+for(iTcellsub in runSetup$cellSubsets) {  
+for(iStimSet in allAntigens) {
+  
+  iModel = paste(runSetup$shortRunDesc,iTcellsub,iStimSet,sep=":")
+    
+  cFilename = justGraphicsSetupOnePage(plotFileName=plotFileNameHeat,pageNum = currentCap, 
+                                         plotFileType=plotFileType, addDate=FALSE)
+    
+  if(plotFileType=="PDF") {
+    pdf(file = cFilename, height=height,width=width)
+  } else if(plotFileType=="PS") {
+    pdf(file = cFilename, height=height,width=width)
+  } else { #PNG
+    png(file = cFilename, height=height,width=width, units="in",res=150,bg="white")
+  }
+  
+  main = paste(iProtocol," Summary\n",iTcellsub," - ",iStimSet,sep="")  
+  
+  show_rownames = TRUE
+
+  ccFitSumm = summaryList[[iModel]]
+
+  VISIT = NULL
+  Trt = NULL
+    
+  Var1 =  runSetup$colRxCodes
+  names(Var1) = allRxcodes      
+  row_ann_col = list(Trt=Var1)      
+  ccFitSumm$data$meta$Trt = ccFitSumm$data$meta$rx_code
+
+  plot(ccFitSumm,row_annotation="Trt",
+         #subset = VISIT == 10 & Trt %in% c("HVTN 100 Placebo","HVTN 100 ALVAC needle"),
+         threshold = -1, order_by=NULL, 
+         show_rownames = show_rownames,
+         breaks = seq(0,1,by=.05),
+         main = main,order_by_max_functionality=FALSE,
+         row_annotation_colors = row_ann_col)
+    
+  dev.off()
+    
+  capList[[currentCap]] = gsub("\n", " - ",main)
+  currentCap = currentCap + 1
+    
+}}
+
+```
+
+
+### Profile box plots
+```{r profileBoxplots, cache=TRUE,eval=TRUE}
+
+#### NOW PLOT THE profile boxplots  
+
+iCapProfile = 1
+capListProfile = list()
+ 
+plotFileNameProfileBox = paste("../graph/summProfileBox_",
+                               runSetup$shortRunDesc,"_",format(Sys.Date(), "%d%b%Y"),sep="")
+
+fnameProfileBox = justGraphicsSetupOnePage(plotFileName=plotFileNameProfileBox,pageNum = NULL, 
+                                   plotFileType=plotFileType)
+
+for(iTcellsub in runSetup$cellSubsets) {
+for(iStimSet in allAntigens) {
+    
+  cAllProfilesOrderNew = plotSetList[[iTcellsub]][["allProfilesOrderNew"]]    
+  cBigCategories = plotSetList[[iTcellsub]][["bigCategories"]]
+  
+  maxDegree = max(cBigCategories[,"Counts"])
+  while(length(which(cBigCategories[,"Counts"] >= maxDegree)) <= 2) {
+    maxDegree = maxDegree-1
+  }
+  
+  iModel = paste(runSetup$shortRunDesc,iTcellsub,iStimSet,sep=":")  
+    
+  ccFitSumm = fitCopySave[[iModel]]
+  magSumm = pctPosAdjList[[iModel]]
+  
+  meta = subset(ccFitSumm$data$meta,
+                PTID.VISITNO %in% rownames(ccFitSumm$fit$mean_gamma))[,c("PTID",
+                "PTID.VISITNO","VISITNO","rx_code")]
+  mg = ccFitSumm$fit$mean_gamma[meta$PTID.VISITNO,]
+  colnames(mg) = paste("y.",colnames(mg),sep="")
+  meta$estimate = "Mean Gamma"
+  
+  meta3 = subset(magSumm$data$meta,PTID.VISITNO %in%
+                  rownames(magSumm$fit$mean_gamma))[,c("PTID","PTID.VISITNO","VISITNO","rx_code")]
+  mg3 = magSumm$fit$mean_gamma[meta3$PTID.VISITNO,]
+  colnames(mg3) = paste("y.",colnames(mg3),sep="")
+  meta3$estimate = "Magnitude"  
+
+  forReshaping = rbind(cbind(meta,mg),cbind(meta3,mg3))
+
+  mgReshape = reshape(forReshaping,direction="long",
+                      idvar = c("PTID","VISITNO","PTID.VISITNO","rx_code","estimate"),
+                      varying=5+1:ncol(mg),timevar="profile")
+  mgReshape$PTID = as.numeric(as.character(mgReshape$PTID))
+  rownames(mgReshape)=NULL
+    
+  mgReshape$profile = factor(mgReshape$profile,cAllProfilesOrderNew)
+  mgReshape$degree = ccFitSumm$fit$categories[mgReshape$profile,"Counts"]
+
+  makeProfileLabel = function(profileIn) {
+      ss = rev(strsplit(profileIn,"&")[[1]])
+      if(length(grep("!",ss)) >0) {
+        return(paste(ss[-grep("!",ss)],collapse="\n"))
+      } else {
+        return(paste(ss,collapse="\n"))          
+      }
+    }
+  makeProfileLabel2 = function(profileIn) {
+      ss = rev(strsplit(profileIn,"&")[[1]])
+      ssOut = rep("+",length(ss))
+      whichNeg = grep("!",ss)
+      if(length(whichNeg) >0) {
+        ssOut[whichNeg] = "-"
+      }
+      paste(ssOut,collapse="\n")
+  }      
+  
+  mgReshape$profileLab = sapply(as.character(mgReshape$profile),makeProfileLabel)
+  mgReshape$profileLab2 = sapply(as.character(mgReshape$profile),makeProfileLabel2)
+  uu = unique(mgReshape[,c("profile","profileLab","profileLab2")])
+  profileLabLevels = uu[order(uu$profile),"profileLab"]
+  profileLab2Levels = uu[order(uu$profile),"profileLab2"]
+  mgReshape$profileLab = factor(mgReshape$profileLab,levels = profileLabLevels)
+  mgReshape$profileLab2 = factor(mgReshape$profileLab2,levels = profileLab2Levels)
+    
+  cytNames = rev(strsplit(as.character(mgReshape$profile[1]),"&")[[1]])
+  cytNames = gsub("!","",cytNames)    
+
+  mgReshape$colVec = runSetup$colRxCodes[match(mgReshape$rx_code,allRxcodes)]  
+  
+  for(iVisit in runSetup$visitsToInclude) {   
+  for(iDegree in 1:maxDegree) {
+  for(iEstimate in c("Mean Gamma","Magnitude")) {
+  for(iTrtGrp in names(runSetup$rxCodeGroups)) {      
+
+    if(iDegree == maxDegree) {
+      subCData = subset(mgReshape,degree >= maxDegree & estimate==iEstimate & VISITNO == iVisit)      
+    } else {
+      subCData = subset(mgReshape,degree==iDegree & estimate==iEstimate & VISITNO == iVisit)      
+    }
+    subCData = subset(subCData,rx_code %in% runSetup$rxCodeGroups[[iTrtGrp]]) 
+    subCData$rx_code = factor(subCData$rx_code, levels = runSetup$rxCodeGroups[[iTrtGrp]])
+      
+    width = 10
+    height = 6.5
+      
+    subCData$profileLab = factor(subCData$profileLab)  
+    subCData$profileLab2 = factor(subCData$profileLab2)  
+      
+    cexList$subMainLine = 2.5
+    cexList$YLabelLineSingle= 5   # default 4      
+      
+    cexList$bigTLineSingle = 0 # -0.5
+    cexList$cex.bigTitle = 1.8 # 1.65
+    cexList$cex.boxpoints = 1.5 #1
+    cexList$cex.plotAxisSingle = 1.4
+      
+    cexList$cex.boxpoints = 1.2 #default 1.5
+
+    #######
+    # Mean Gamma plot
+      
+    cFilename = justGraphicsSetupOnePage(plotFileName=plotFileNameProfileBox,
+                                         pageNum = iCapProfile, plotFileType=plotFileType, 
+                                         addDate=FALSE)
+      
+    if(plotFileType=="PDF") {
+      pdf(file = cFilename, height=height,width = width) #width=10)
+    } else {
+      png(file = cFilename, height=height,width=width, units="in",res=150)
+    }
+      
+    #layoutPage(suppressTables=TRUE)
+    par(pardefault)
+    par(oma=c(.5,0,3,0)) # oma=c(.5,0,3,0)
+    layout(matrix(c(1,0,2)),height=c(lcm(11.1),lcm(1.75),lcm(2.1)))  #height=c(lcm(12.0),lcm(.85),lcm(2.1)))   
+    
+    colVec =  runSetup$colRxCodes[match(runSetup$rxCodeGroups[[iTrtGrp]],names(runSetup$rxCodes))]
+    trtLabels = runSetup$rxCodes[runSetup$rxCodeGroups[[iTrtGrp]]]
+    colBoxes = data.frame(rx_code = runSetup$rxCodeGroups[[iTrtGrp]],
+                          colVec = colVec, stringsAsFactors = FALSE)  
+     
+    if(iEstimate == "Mean Gamma") {
+      ylab="Probability of Response"
+      log.cutoff = NULL
+      plotHeader = paste(iProtocol," Summary - ",sep="")
+      ylim= NULL
+      logY = FALSE 
+    } else { # "Magnitude"
+      # NOTE: pctPosAdjList is log10(pmax(logCutoff,data))  where logCutoff=.000001
+      ylab="Pct Positive (adjusted)"
+      log.cutoff = NULL #0.0001
+      plotHeader = paste(iProtocol," Summary (Magnitude) - ",sep="")
+      logY = "log10" 
+      ylim = c(.0002,10) #10^c(-6,1)
+      #legend_breaks=c(-6,-4:1)  
+      #legend_labels = c(".000001",".0001",".001",".01",".1","1","10"),
+    }
+      
+    subCData$dummy = factor(1)
+    
+    bbgOut = boxplotgrp2(subCData,y="y",grp1="dummy",grp2="rx_code", grp3="profileLab2",
+                         ylim = ylim, logY = logY,
+                         grp2Label = "", grp2Line = 0.5, log.cutoff = log.cutoff, 
+                         #grp3Line = -1 + 1.5*iDegree,
+                         grp3Line = 7,
+                         main="", ylab=ylab, grp2LabCex = .9,grp3LabCex = .9,
+                         diagGrp2Lab = FALSE,bottomGrp3Lab = TRUE,
+                         colVec = subCData$colVec, pchVec=subCData$pchVec,
+                         bgVec=subCData$bgVec,colBoxes=colBoxes)
+    #doLinesAlso = TRUE,id="ptidscore")#extraLegendSpacing=1) 
+    if(iEstimate == "Magnitude") {
+      #axis(side=2,at=c(.0002,.0005,.002,.005,.02,.05,.2,.5,2,5),labels=FALSE)
+      axis(side=2,at=rep(2:9,5)*rep(10^c(-4,-3,-2,-1,-0),each=8),labels=FALSE)  
+    }
+    
+    mtext( paste(cytNames,collapse="\n"), at=par("usr")[1], 
+           outer=F, side=1, line=7, cex=.9,font=2,adj = 0)
+      
+    if(length(unique(subCData$profileLab2)) == 1) {   
+      mtext(subCData$profileLab2[1], at=.5*bbgOut$locVec[1] + .5*bbgOut$locVec[2], 
+            outer=F, side=1, line=7, cex=.9,font=2)
+    }      
+
+    iVisitLabel = runSetup$visitLabels[match(iVisit,runSetup$visitsToInclude)]
+
+    main = paste(plotHeader,iTcellsub,", ",iStimSet,", ",iVisitLabel,", ",iTrtGrp,sep="") 
+    main2 = paste("Degree ",iDegree,sep="")
+    caption = paste(main,main2,sep=" - ")
+    main = gsub(" - ","\n",main)
+      
+    parcex = par("cex")
+    title(main=main, cex.main=1.7/parcex,outer=TRUE, line=-1.5, font = 2)
+    title(main=main2, cex.main=1.3/parcex,outer=TRUE, line=-3.25, font = 2)
+      
+    # add legend
+    par(mar = c(0,0,0,0))
+    plot(0:1,0:1,type="n",axes=FALSE,xlab="",ylab="",main="")
+    
+    legend("center", legend = trtLabels, col = colVec, pch = 19, 
+           bty="n",cex = 1.6) 
+    
+    capListProfile[[iCapProfile]] = caption
+    iCapProfile = iCapProfile + 1
+      
+    dev.off()
+      
+  }}}}
+}}    
+
+    
+
+```
+
+### Write latex of graphs
+
+```{r writeLatex, cache = TRUE, eval = TRUE}
+
+
+texWrapper = paste("../latex/combinedPlots_",runSetup$shortRunDesc,"_",
+                   format(Sys.Date(), "%d%b%Y"),".tex",sep="")
+
+customCover = formatLatexCoverPageWithHeader(
+  paste(iProtocol," Polyfunctionality via COMPASS",sep=""),"17-color panel",     
+  "Daryl Morris",incTablesIndex=FALSE)
+  
+cat(customCover,file = texWrapper,append=FALSE)
+
+figNum = writeTexPlotWrapper(capListBox,pB =NULL,
+                             fname = fnameBox , 
+                             texWrapper= texWrapper,
+                             correlationPlots = FALSE, figNum = 0, 
+                             uOutcomes = NULL, labelBase = NULL,
+                             plotFileType=plotFileType, noTekHeaderFooter = TRUE)
+
+if(FALSE) {
+  # summary boxplots
+figNum = writeTexPlotWrapper(capListSB,pB =NULL,
+                             fname = fnameSB , 
+                             texWrapper= texWrapper,
+                             correlationPlots = FALSE, figNum = 0, 
+                             uOutcomes = NULL, labelBase = "sumBox",
+                             plotFileType=plotFileType, noTekHeaderFooter = TRUE)
+}
+
+if(FALSE) {
+  if(length(capListProfile) > 0) {
+    # profile boxplots
+    figNum = writeTexPlotWrapper(capListProfile,pB =NULL,
+                               fname = fnameProfileBox , 
+                               texWrapper= texWrapper,
+                               correlationPlots = FALSE, figNum = 0, 
+                               uOutcomes = NULL, labelBase = "sumProfileBox",
+                               plotFileType=plotFileType, noTekHeaderFooter = TRUE)
+}}
+
+# regular heatmaps
+writeTexPlotWrapperSubset(cL=capList,subset=1:(preCollapsed-1),plotsPerPage = 1,
+                          fname=fname, texWrapper=texWrapper, 
+                          figNum = NULL, labelBase = "heat", plotFileType=plotFileType,
+                          height = 8)
+
+if(length(capList) >  preCollapsed) {
+  # summary heatmaps
+  writeTexPlotWrapperSubset(cL=capList,subset=preCollapsed:(currentCap-1),plotsPerPage = 1,
+                          fname=fname, texWrapper=texWrapper, 
+                          figNum = NULL, labelBase = "sumHeat", plotFileType=plotFileType,
+                          height = 3.1)
+}
+
+
+cat(latexFooter,file = texWrapper,append=TRUE)
+
+```
+
+
+
+```{r writeProfileBoxTexOnly, cache = TRUE, eval = TRUE}
+
+texWrapper = paste("../latex/profileBoxPlots_",runSetup$shortRunDesc,"_",
+                   format(Sys.Date(), "%d%b%Y"),".tex",sep="")
+
+customCover = formatLatexCoverPageWithHeader(
+  paste(iProtocol," Polyfunctionality via COMPASS",sep=""),"Profile boxplots - 17-color panel",     
+  "Daryl Morris",incTablesIndex=FALSE)
+  
+cat(customCover,file = texWrapper,append=FALSE)
+
+if(length(capListProfile) > 0) {
+    # profile boxplots
+    figNum = writeTexPlotWrapper(capListProfile,pB =NULL,
+                               fname = fnameProfileBox , 
+                               texWrapper= texWrapper,
+                               correlationPlots = FALSE, figNum = 0, 
+                               uOutcomes = NULL, labelBase = "sumProfileBox",
+                               plotFileType=plotFileType, noTekHeaderFooter = TRUE)
+}
+
+cat(latexFooter,file = texWrapper,append=TRUE)
+
+```
+
+
+### Describe available data.
+
+```{r dataAvailTable, cache = TRUE, eval = TRUE}
+
+sumMatSub = subset(sumMat,profileSet=="noIL4GzB" & score=="FunctionalityScore")
+
+table(paste(sumMatSub$tcellsub,sumMatSub$stimSet),paste(sumMatSub$VISITNO, sumMatSub$rx_code))
+
+```
+
+
+### Testing of scores across groups.
+
+```{r testScores, cache = TRUE, eval = TRUE}
+
+
+wtresultAll = list()
+
+subTest = subset(sumMat,profileSet=="noIL4GzB")
+
+compList = as.data.frame(t(combn(allRxcodes,2)),stringsAsFactors = FALSE)
+rownames(compList) = apply(compList,1,paste,collapse=" vs. ")
+
+
+for(iStimSet in allAntigens) {
+for(iTcellsub in runSetup$cellSubsets) {  
+for(iScore in c("FunctionalityScore","PolyfunctionalityScore")) {
+for(iVisit in runSetup$visitsToInclude) {   
+for(iComp in rownames(compList)) {
+
+  subName = paste(iStimSet,iTcellsub,iVisit,iScore,iComp,sep=" - ")
+        
+  subCData = subset(subTest,tcellsub == iTcellsub & stimSet==iStimSet & 
+                      score==iScore & VISITNO==iVisit)
+  if(nrow(subCData)==0) {
+    cat("No rows for ",iStimSet," - ",iTcellsub," - ",iScore," - ",iVisit,"\n")
+    next
+  }
+        
+  ss1.y = subset(subCData,rx_code==compList[iComp,"V1"])$y 
+  ss2.y = subset(subCData,rx_code==compList[iComp,"V2"])$y
+  n1 = length(ss1.y)
+  n2 = length(ss2.y)
+  if(any(c(ss1.y,ss2.y) > 0)) {
+    temp = wilcox.test(ss1.y, ss2.y, conf.int=TRUE)
+    tempV1 = c(temp$estimate,temp$conf.int,temp$p.value,n1,n2)
+  } else {
+    tempV1 = c(0,0,0,1,n1,n2)
+  }
+  names(tempV1) = c("location diff estimate","CIL","CIH","P.value","n1","n2")
+        wtresultAll[[subName]] = tempV1
+        
+}}}}}
+
+T1T2 = data.frame(do.call(rbind,wtresultAll))
+T1T2$subset = rownames(T1T2)
+rownames(T1T2) = NULL
+T1T2$signif = 1*(as.numeric(as.character(T1T2[["P.value"]])) <= .05)
+
+T1T2justNums = subset(T1T2,select=-subset)
+T1T2justNums = apply(T1T2justNums,2,function(x) round(x,4))
+
+subsetSplit = data.frame(do.call(rbind,sapply(T1T2$subset,function(x) strsplit(x," - "))))
+rownames(subsetSplit)= NULL
+
+tableForOutput = data.frame(subsetSplit[,c(2,1,4,5,3)],T1T2justNums)
+names(tableForOutput) = c("T-cell Subset","Peptide Pool","Score","Contrast",
+                          "Visit","Difference","CI lower","CI high",
+                          "p-value","n1","n2","Significant")
+tableForOutput$`Peptide Pool` = factor(tableForOutput$`Peptide Pool`,levels = allAntigens)
+
+tableForOutput = tableForOutput[order(tableForOutput[["T-cell Subset"]],
+                                      tableForOutput[["Peptide Pool"]],
+                                      tableForOutput[["Score"]]),]
+
+idvar = c("T-cell Subset","Peptide Pool","Contrast") #,"Visit")
+temp = tableForOutput
+temp$VisitScore = paste(temp$Visit,temp$Score,sep=".")
+tableForOutput.w = reshape(temp[,c(idvar,"VisitScore","p-value")],direction="wide",
+                           idvar = idvar,timevar = c("VisitScore"))
+tableForOutput= removeDupsInColumn(tableForOutput,columns=c("T-cell Subset","Peptide Pool","Score"))
+
+# can remove these after you do a sanity check.
+tableForOutput$n1 = NULL
+tableForOutput$n2 = NULL
+
+write.table(tableForOutput,paste("COMPASS_",runSetup$shortRunDesc,"_test.csv",sep=""),
+            sep=",",row.names=FALSE)
+
+#reduce wide version to significant tests
+newTableNames = paste(rep(c("FS (p-value)","PFS (p-value)"),each=length(runSetup$visitsToInclude)),
+                      rep(runSetup$visitsToInclude,2),sep="\nVisit ")
+                      
+names(tableForOutput.w)[length(idvar)+(1:length(newTableNames))] = newTableNames
+#tableForOutput.w = subset(tableForOutput.w,`FS (p-value)`<= .05 | `PFS (p-value)` <= 0.05)
+ww=which(tableForOutput.w[,4] < .05 | tableForOutput.w[,5] < .05 | tableForOutput.w[,6] < .05 | tableForOutput.w[,7] < .05)
+for(iColumn in newTableNames) {
+  tableForOutput.w[[iColumn]] = ifelse(tableForOutput.w[[iColumn]] ==0,
+                                          "<0.0001",as.character(tableForOutput.w[[iColumn]]))
+}
+justSignificant = tableForOutput.w[ww,]
+tableForOutput.w= removeDupsInColumn(tableForOutput.w,columns=idvar)
+justSignificant= removeDupsInColumn(justSignificant,columns=idvar)
+tableForOutput.w$Significant  = ""
+tableForOutput.w$Significant[ww]  = "*"
+
+write.table(tableForOutput.w,paste("COMPASS_",runSetup$shortRunDesc,"_test_w.csv",sep=""),
+            sep=",",row.names=FALSE)
+
+
+headerBase = paste("HVTN 107 is a Phase 1/2a partially double-blinded, randomized clinical ",
+                   "trial to characterize the safety and immunogenicity of ",
+                   "clade C ALVAC-HIV (vCP2438) and Bivalent Subtype C gp120 alone, ",
+                   "with MF59 adjuvant, and with alum adjuvant in healthy, ",
+                   "HIV-uninfected adult participants. ",
+                   "\n \nLab PT Report: COMPASS - Data as of March 3, 2020",sep="")
+headerPos = paste(headerBase,
+                  " \nTable 1: Testing Scores within each antigen, visit and T-cell subset",
+                  sep="\n")
+
+footerTreat = paste(runSetup$rxCodes,collapse="\n ")
+footerVisit = "Visits 15,17,19 and 21 are visit months 6.5, 12, 12.5, and 18."
+footerGroup = paste(footerTreat,footerVisit,sep="\n ")
+
+footerPval = paste("P-value by Wilcoxon rank sum test.\n \n",sep="")
+
+footer = paste(footerPval,footerGroup,sep="\n")
+
+tableName = paste("../latex/compass_",runSetup$shortRunDesc,"_test_table_",
+                  format(Sys.Date(), "%d%b%Y"),".tex",sep="")
+
+
+cat(latexHeaderUglySAS,file=tableName,append=FALSE)
+
+makeSASLatexTables(tableForOutput.w,tekFileName=tableName,append=TRUE,
+                   uglySAS = TRUE,
+                   fontsize = NULL, sideways = TRUE,
+                   colWidths = c(.7,1,.5,rep(.8,length(newTableNames)),.5),
+                   noTekHeaderFooter=TRUE,
+                   pageRows = 40,caption=NULL,footer=footer, header=headerPos, 
+                   labelCols = c("T-cell Subset","Peptide Pool","Contrast"),
+                   footLines=6,headCaptionLines=7, headFootCharWidth = 155)
+
+cat(latexFooter,file=tableName,append=TRUE)
+
+```
